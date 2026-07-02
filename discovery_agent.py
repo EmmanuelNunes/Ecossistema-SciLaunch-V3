@@ -121,9 +121,12 @@ if __name__ == "__main__":
             print(f"  - {w.get('display_name')} ({w.get('publication_year')})")
     except requests.exceptions.HTTPError as e:
         if e.response is not None and e.response.status_code == 503:
-            print(f"\n[Aviso] A busca por texto da API do OpenAlex está temporariamente indisponível (HTTP 503 - Rate Limit).")
-            print("Isso ocorre devido a alta carga no motor de busca pública anônima do OpenAlex.")
-            print("Prosseguindo com o Teste 2 usando o DOI de fallback...\n")
+            print("\n" + "!" * 80)
+            print("ATENÇÃO: A BUSCA POR TEXTO (TESTE 1) FALHOU!")
+            print("Erro HTTP 503 (Service Unavailable): A busca pública anônima do OpenAlex está rate-limited")
+            print("devido a alta carga nos servidores deles. Para resolver isso em produção, use uma chave")
+            print("de API gratuita obtida em https://openalex.org/rest-api.")
+            print("!" * 80 + "\n")
         else:
             print(f"\n[Erro] Falha ao realizar busca por palavra-chave: {e}\n")
 
@@ -137,8 +140,16 @@ if __name__ == "__main__":
             break
             
     if not seed_doi:
-        seed_doi = "10.1152/jappl.1989.66.1.232" # Fallback clássico
-        print(f"\nUsando DOI clássico de fallback: {seed_doi}")
+        seed_doi = "10.1152/jappl.1989.66.1.232" # Fallback de asma de 1989
+        print("\n" + "=" * 80)
+        print("AVISO DE SEGURANÇA METODOLÓGICA (TCC):")
+        print("Como a busca textual por 'resistance training' falhou devido ao rate limit do OpenAlex,")
+        print("o script está utilizando o DOI clássico de fallback: 10.1152/jappl.1989.66.1.232.")
+        print("IMPORTANTE: Este paper é sobre farmacologia/asma e epitélio traqueal de porquinho-da-índia de 1989.")
+        print("Ele NÃO tem relação com treino de força ou hipertrofia.")
+        print("Este grafo gerado serve EXCLUSIVAMENTE para provar a integridade mecânica de conexões do script.")
+        print("NÃO utilize este grafo gerado como resultado no seu referencial teórico do TCC!")
+        print("=" * 80 + "\n")
 
     # Limitamos para 5 de cada lado para rodar o teste de forma ágil e evitar throttles
     graph = agent.build_citation_graph(seed_doi, backward_limit=5, forward_limit=5)
@@ -149,5 +160,6 @@ if __name__ == "__main__":
         print(f"  {score:.4f}  {title}")
 
     agent.export_interactive_html(graph)
+
 
 
