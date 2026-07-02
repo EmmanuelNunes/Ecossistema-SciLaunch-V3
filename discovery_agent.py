@@ -63,12 +63,17 @@ class SearchAgent:
         ref_ids = work.get("referenced_works", [])[:limit]
         results = []
         for wid in ref_ids:
+            # Corrige o ID canônico para apontar para a API ao invés do site público HTML
+            api_url = wid.replace("https://openalex.org/", f"{OPENALEX_BASE}/")
             params = {}
             if self.api_key:
                 params["api_key"] = self.api_key
-            r = requests.get(wid, headers=self.headers, params=params, timeout=15)
-            if r.ok:
-                results.append(r.json())
+            try:
+                r = requests.get(api_url, headers=self.headers, params=params, timeout=15)
+                if r.ok:
+                    results.append(r.json())
+            except Exception as e:
+                print(f"[Erro] Falha ao recuperar referência {wid}: {e}")
             sleep(0.1)  # respeito ao rate limit, não é decoração
         return results
 
@@ -167,15 +172,13 @@ if __name__ == "__main__":
             break
             
     if not seed_doi:
-        seed_doi = "10.1152/jappl.1989.66.1.232" # Fallback de asma de 1989
+        seed_doi = "10.1519/jsc.0b013e3181e840f3" # Fallback de hipertrofia de 2010
         print("\n" + "=" * 80)
-        print("AVISO DE SEGURANÇA METODOLÓGICA (TCC):")
-        print("Como a busca textual por 'resistance training' falhou devido ao rate limit do OpenAlex,")
-        print("o script está utilizando o DOI clássico de fallback: 10.1152/jappl.1989.66.1.232.")
-        print("IMPORTANTE: Este paper é sobre farmacologia/asma e epitélio traqueal de porquinho-da-índia de 1989.")
-        print("Ele NÃO tem relação com treino de força ou hipertrofia.")
-        print("Este grafo gerado serve EXCLUSIVAMENTE para provar a integridade mecânica de conexões do script.")
-        print("NÃO utilize este grafo gerado como resultado no seu referencial teórico do TCC!")
+        print("AVISO DE LOG (FALLBACK ATIVO):")
+        print("Como a busca por texto falhou ou não retornou resultados com DOI,")
+        print("o script está utilizando o DOI de fallback clássico de hipertrofia:")
+        print("10.1519/jsc.0b013e3181e840f3 (The Mechanisms of Muscle Hypertrophy...)")
+        print("Esse grafo gerado pertence ao seu domínio real de treinamento de força.")
         print("=" * 80 + "\n")
 
     # Limitamos para 5 de cada lado para rodar o teste de forma ágil e evitar throttles
