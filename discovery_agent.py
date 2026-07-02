@@ -2,6 +2,7 @@ import requests
 import networkx as nx
 from pyvis.network import Network
 from time import sleep
+from collections import OrderedDict
 
 OPENALEX_BASE = "https://api.openalex.org/works"
 
@@ -23,8 +24,20 @@ class SearchAgent:
         self.headers = {"User-Agent": f"SciLaunch-SearchAgent (mailto:{contact_email})"}
         # Se não for passada api_key, tenta carregar da variável de ambiente OPENALEX_API_KEY
         self.api_key = api_key or os.environ.get("OPENALEX_API_KEY")
-        # Cache local em memória para evitar requisições redundantes à API na mesma sessão
-        self._works_cache = {}
+        # Fix 1: autenticação via header HTTP Bearer — não expõe a chave em URLs, logs de proxy ou histórico de rede
+        if self.api_key:
+            self.headers["Authorization"] = f"Bearer {self.api_key}"
+        # Fix 3: cache LRU com tamanho máximo para evitar crescimento ilimitado em sessões longas
+        self._works_cache: OrderedDict = OrderedDict()
+        self._cache_maxsize = 1000
+
+    def _cache_set(self, key: str, value: dict) -> None:
+        """Registra um item no cache LRU. Descarta o mais antigo ao atingir maxsize."""
+        if key in self._works_cache:
+            self._works_cache.move_to_end(key)
+        self._works_cache[key] = value
+        if len(self._works_cache) > self._cache_maxsize:
+            self._works_cache.popitem(last=False)  # Remove a entrada mais antiga (política FIFO/LRU)
 
     # ------------------------------------------------------------------
     # 1. BUSCA POR TEXTO — o que faltava confirmadamente no sistema antigo
@@ -58,9 +71,6 @@ class SearchAgent:
         if filter_list:
             params["filter"] = ",".join(filter_list)
             
-        if self.api_key:
-            params["api_key"] = self.api_key
-
         r = requests.get(OPENALEX_BASE, headers=self.headers, params=params, timeout=15)
         r.raise_for_status()
         return r.json().get("results", [])
@@ -74,18 +84,15 @@ class SearchAgent:
             return self._works_cache[doi_key]
 
         url = f"{OPENALEX_BASE}/https://doi.org/{doi}"
-        params = {}
-        if self.api_key:
-            params["api_key"] = self.api_key
-        r = requests.get(url, headers=self.headers, params=params, timeout=15)
+        r = requests.get(url, headers=self.headers, timeout=15)
         r.raise_for_status()
         work = r.json()
         
         # Alimenta o cache com o DOI e com o ID do OpenAlex
-        self._works_cache[doi_key] = work
+        self._cache_set(doi_key, work)
         work_id = work.get("id")
         if work_id:
-            self._works_cache[work_id.lower()] = work
+            self._cache_set(work_id.lower(), work)
             
         return work
 
@@ -101,20 +108,17 @@ class SearchAgent:
 
             # Corrige o ID canônico para apontar para a API ao invés do site público HTML
             api_url = wid.replace("https://openalex.org/", f"{OPENALEX_BASE}/")
-            params = {}
-            if self.api_key:
-                params["api_key"] = self.api_key
             try:
-                r = requests.get(api_url, headers=self.headers, params=params, timeout=15)
+                r = requests.get(api_url, headers=self.headers, timeout=15)
                 if r.ok:
                     res_json = r.json()
                     results.append(res_json)
                     # Registra no cache
-                    self._works_cache[wid_key] = res_json
+                    self._cache_set(wid_key, res_json)
                     doi = res_json.get("doi")
                     if doi:
                         clean_doi = doi.replace("https://doi.org/", "").lower().strip()
-                        self._works_cache[clean_doi] = res_json
+                        self._cache_set(clean_doi, res_json)
             except Exception as e:
                 print(f"[Erro] Falha ao recuperar referência {wid}: {e}")
             sleep(0.1)  # respeito ao rate limit, não é decoração
@@ -123,8 +127,6 @@ class SearchAgent:
     def get_citing_works(self, work_id: str, limit: int = 15) -> list[dict]:
         """FORWARD: quem cita o work. Filtro cites: na API de listagem."""
         params = {"filter": f"cites:{work_id}", "per-page": limit}
-        if self.api_key:
-            params["api_key"] = self.api_key
         r = requests.get(OPENALEX_BASE, headers=self.headers, params=params, timeout=15)
         r.raise_for_status()
         works = r.json().get("results", [])
@@ -133,19 +135,22 @@ class SearchAgent:
         for work in works:
             w_id = work.get("id")
             if w_id:
-                self._works_cache[w_id.lower()] = work
+                self._cache_set(w_id.lower(), work)
             doi = work.get("doi")
             if doi:
                 clean_doi = doi.replace("https://doi.org/", "").lower().strip()
-                self._works_cache[clean_doi] = work
+                self._cache_set(clean_doi, work)
                 
         return works
 
-    def build_citation_graph(self, seed_dois: str | list[str], backward_limit=15, forward_limit=15) -> nx.DiGraph:
+    def build_citation_graph(self, seed_dois: str | list[str], backward_limit=15, forward_limit=15, source: str = "api") -> nx.DiGraph:
         """
         Monta o grafo dirigido: aresta A -> B significa 'A cita B'.
         Aceita um DOI único ou uma lista de DOIs sementes (3-5) para produzir
         um grafo com interconexões ricas e PageRank estatisticamente útil.
+
+        source: identificador de proveniência dos dados ('api', 'fallback_static', etc.).
+                Fix 2: deve ser definido pelo chamador aqui — não sobrescrever externamente após o retorno.
         """
         G = nx.DiGraph()
         
@@ -153,7 +158,7 @@ class SearchAgent:
         if isinstance(seed_dois, str):
             seed_dois = [seed_dois]
             
-        G.graph["source"] = "api"
+        G.graph["source"] = source
         G.graph["seeds"] = seed_dois
         G.graph["failed_seeds"] = []
         
@@ -184,6 +189,12 @@ class SearchAgent:
         return G
 
     def rank_by_centrality(self, G: nx.DiGraph) -> list[tuple[str, float]]:
+        # Fix 4: falha explícita em vez de output silencioso quando o grafo está vazio
+        if G.number_of_nodes() == 0:
+            raise ValueError(
+                "O grafo está vazio. Todas as sementes falharam no processamento. "
+                "Verifique G.graph['failed_seeds'] para diagnóstico."
+            )
         scores = nx.pagerank(G)
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
         return [(G.nodes[nid].get("title", nid), score) for nid, score in ranked]
@@ -276,12 +287,13 @@ if __name__ == "__main__":
     print(f"Testando a construção de grafo com seeds: {test_seeds}")
     
     # Limitamos para 5 de cada lado para rodar o teste de forma ágil e evitar throttles
-    graph = agent.build_citation_graph(test_seeds, backward_limit=5, forward_limit=5)
-    
-    if is_fallback:
-        graph.graph["source"] = "fallback_static"
-    else:
-        graph.graph["source"] = "api"
+    # Fix 2: source declarado como parâmetro na chamada — não sobrescrito externamente após o retorno
+    graph = agent.build_citation_graph(
+        test_seeds,
+        backward_limit=5,
+        forward_limit=5,
+        source="fallback_static" if is_fallback else "api"
+    )
         
     print(f"\n=== RESULTADOS E AUDITORIA DO GRAFO ===")
     print(f"Proveniência dos dados do grafo (graph.graph['source']): {graph.graph.get('source')}")
