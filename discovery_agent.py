@@ -17,9 +17,12 @@ class SearchAgent:
     empacotar algo vago sob um nome bonito.
     """
 
-    def __init__(self, contact_email: str = "emmanuel.nunes.discovery@gmail.com"):
+    def __init__(self, contact_email: str = "emmanuel.nunes.discovery@gmail.com", api_key: str | None = None):
+        import os
         # OpenAlex pede identificação para priorizar no "polite pool"
         self.headers = {"User-Agent": f"SciLaunch-SearchAgent (mailto:{contact_email})"}
+        # Se não for passada api_key, tenta carregar da variável de ambiente OPENALEX_API_KEY
+        self.api_key = api_key or os.environ.get("OPENALEX_API_KEY")
 
     # ------------------------------------------------------------------
     # 1. BUSCA POR TEXTO — o que faltava confirmadamente no sistema antigo
@@ -36,6 +39,8 @@ class SearchAgent:
         if filters:
             filter_str = ",".join(f"{k}:{v}" for k, v in filters.items())
             params["filter"] = filter_str
+        if self.api_key:
+            params["api_key"] = self.api_key
 
         r = requests.get(OPENALEX_BASE, headers=self.headers, params=params, timeout=15)
         r.raise_for_status()
@@ -46,7 +51,10 @@ class SearchAgent:
     # ------------------------------------------------------------------
     def get_work_by_doi(self, doi: str) -> dict:
         url = f"{OPENALEX_BASE}/https://doi.org/{doi}"
-        r = requests.get(url, headers=self.headers, timeout=15)
+        params = {}
+        if self.api_key:
+            params["api_key"] = self.api_key
+        r = requests.get(url, headers=self.headers, params=params, timeout=15)
         r.raise_for_status()
         return r.json()
 
@@ -55,7 +63,10 @@ class SearchAgent:
         ref_ids = work.get("referenced_works", [])[:limit]
         results = []
         for wid in ref_ids:
-            r = requests.get(wid, headers=self.headers, timeout=15)
+            params = {}
+            if self.api_key:
+                params["api_key"] = self.api_key
+            r = requests.get(wid, headers=self.headers, params=params, timeout=15)
             if r.ok:
                 results.append(r.json())
             sleep(0.1)  # respeito ao rate limit, não é decoração
@@ -64,6 +75,8 @@ class SearchAgent:
     def get_citing_works(self, work_id: str, limit: int = 15) -> list[dict]:
         """FORWARD: quem cita o work. Filtro cites: na API de listagem."""
         params = {"filter": f"cites:{work_id}", "per-page": limit}
+        if self.api_key:
+            params["api_key"] = self.api_key
         r = requests.get(OPENALEX_BASE, headers=self.headers, params=params, timeout=15)
         r.raise_for_status()
         return r.json().get("results", [])
@@ -109,6 +122,20 @@ class SearchAgent:
 
 
 if __name__ == "__main__":
+    import os
+    api_key = os.environ.get("OPENALEX_API_KEY")
+    if not api_key:
+        print("\n" + "*" * 80)
+        print("AVISO: Variável de ambiente 'OPENALEX_API_KEY' não detectada.")
+        print("O script tentará executar no modo ANÔNIMO (sujeito a bloqueios 503 sob alta carga).")
+        print("Para configurar a chave no PowerShell, execute:")
+        print("  $env:OPENALEX_API_KEY=\"SUA_CHAVE_AQUI\"")
+        print("*" * 80 + "\n")
+    else:
+        # Exibe apenas os primeiros e últimos caracteres por motivos de segurança
+        masked_key = f"{api_key[:6]}...{api_key[-4:]}" if len(api_key) > 10 else "configurada"
+        print(f"\n[Info] Utilizando chave de API detectada via variável de ambiente ({masked_key})\n")
+
     agent = SearchAgent(contact_email="emmanuel.nunes.discovery@gmail.com")
 
     # --- Teste 1: busca por texto real (o que faltava) ---
