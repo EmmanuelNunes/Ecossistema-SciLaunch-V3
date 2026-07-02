@@ -27,18 +27,31 @@ class SearchAgent:
     # ------------------------------------------------------------------
     # 1. BUSCA POR TEXTO — o que faltava confirmadamente no sistema antigo
     # ------------------------------------------------------------------
-    def search_by_keyword(self, query: str, limit: int = 20, filters: dict | None = None) -> list[dict]:
+    def search_by_keyword(self, query: str, limit: int = 20, filters: dict | None = None, title_and_abstract_only: bool = True) -> list[dict]:
         """
         Busca real por palavra-chave na OpenAlex, não retrieval sobre
         Zotero pré-carregado. Isso é o que faz o sistema achar papers
         que você nunca importou manualmente.
 
         filters: dict opcional, ex: {"from_publication_date": "2015-01-01"}
+        title_and_abstract_only: se True, restringe a busca ao título e resumo para aumentar a precisão de domínio.
         """
-        params = {"search": query, "per-page": limit}
+        params = {"per-page": limit}
+        
+        filter_list = []
+        if title_and_abstract_only:
+            # A busca em campos específicos no OpenAlex deve ser enviada como um filtro
+            filter_list.append(f"title_and_abstract.search:{query}")
+        else:
+            params["search"] = query
+            
         if filters:
-            filter_str = ",".join(f"{k}:{v}" for k, v in filters.items())
-            params["filter"] = filter_str
+            for k, v in filters.items():
+                filter_list.append(f"{k}:{v}")
+                
+        if filter_list:
+            params["filter"] = ",".join(filter_list)
+            
         if self.api_key:
             params["api_key"] = self.api_key
 
@@ -86,27 +99,43 @@ class SearchAgent:
         r.raise_for_status()
         return r.json().get("results", [])
 
-    def build_citation_graph(self, seed_doi: str, backward_limit=15, forward_limit=15) -> nx.DiGraph:
+    def build_citation_graph(self, seed_dois: str | list[str], backward_limit=15, forward_limit=15) -> nx.DiGraph:
         """
         Monta o grafo dirigido: aresta A -> B significa 'A cita B'.
-        Aviso honesto: com um único seed e ~30 nós, PageRank sobre esse
-        grafo é quase decorativo. Use múltiplos seeds (3-5) antes de
-        confiar em qualquer ranking de centralidade.
+        Aceita um DOI único ou uma lista de DOIs sementes (3-5) para produzir
+        um grafo com interconexões ricas e PageRank estatisticamente útil.
         """
         G = nx.DiGraph()
-        seed = self.get_work_by_doi(seed_doi)
-        seed_id = seed["id"]
-        G.add_node(seed_id, title=seed.get("display_name", "seed"), kind="seed")
+        
+        # Normaliza a entrada para ser sempre uma lista
+        if isinstance(seed_dois, str):
+            seed_dois = [seed_dois]
+            
+        G.graph["source"] = "api"
+        G.graph["seeds"] = seed_dois
+        
+        for seed_doi in seed_dois:
+            try:
+                seed = self.get_work_by_doi(seed_doi)
+                seed_id = seed["id"]
+                # Adiciona ou atualiza o nó semente no grafo
+                G.add_node(seed_id, title=seed.get("display_name", "seed"), kind="seed")
 
-        for ref in self.get_referenced_works(seed, limit=backward_limit):
-            rid = ref["id"]
-            G.add_node(rid, title=ref.get("display_name", "?"), kind="backward")
-            G.add_edge(seed_id, rid)
+                for ref in self.get_referenced_works(seed, limit=backward_limit):
+                    rid = ref["id"]
+                    # Evita rebaixar um nó que é semente para "backward"
+                    if rid not in G or G.nodes[rid].get("kind") != "seed":
+                        G.add_node(rid, title=ref.get("display_name", "?"), kind="backward")
+                    G.add_edge(seed_id, rid)
 
-        for citer in self.get_citing_works(seed_id, limit=forward_limit):
-            cid = citer["id"]
-            G.add_node(cid, title=citer.get("display_name", "?"), kind="forward")
-            G.add_edge(cid, seed_id)
+                for citer in self.get_citing_works(seed_id, limit=forward_limit):
+                    cid = citer["id"]
+                    # Evita rebaixar um nó que é semente para "forward"
+                    if cid not in G or G.nodes[cid].get("kind") != "seed":
+                        G.add_node(cid, title=citer.get("display_name", "?"), kind="forward")
+                    G.add_edge(cid, seed_id)
+            except Exception as e:
+                print(f"[Erro] Falha ao processar a semente {seed_doi}: {e}")
 
         return G
 
@@ -143,12 +172,12 @@ if __name__ == "__main__":
 
     agent = SearchAgent(contact_email="emmanuel.nunes.discovery@gmail.com")
 
-    # --- Teste 1: busca por texto real (o que faltava) ---
-    QUERY = "resistance training structural variables"
+    # --- Teste 1: busca por texto real refinada (Precisão de Domínio) ---
+    QUERY = "resistance training hypertrophy"
     results = []
     try:
-        results = agent.search_by_keyword(QUERY, limit=10)
-        print(f"Busca por '{QUERY}': {len(results)} resultados")
+        results = agent.search_by_keyword(QUERY, limit=5, title_and_abstract_only=True)
+        print(f"Busca Refinada por '{QUERY}': {len(results)} resultados")
         for w in results[:5]:
             print(f"  - {w.get('display_name')} ({w.get('publication_year')})")
     except requests.exceptions.HTTPError as e:
@@ -162,30 +191,40 @@ if __name__ == "__main__":
         else:
             print(f"\n[Erro] Falha ao realizar busca por palavra-chave: {e}\n")
 
-    # --- Teste 2: expansão por citação a partir de um DOI real ---
-    seed_doi = None
+    # --- Teste 2: expansão por citação a partir de múltiplos DOIs reais ---
+    seed_dois = []
     for w in results:
         doi_url = w.get("doi")
         if doi_url:
-            seed_doi = doi_url.replace("https://doi.org/", "")
-            print(f"\nUsando o DOI encontrado na busca para o teste de expansão: {seed_doi}")
-            break
-            
-    if not seed_doi:
-        seed_doi = "10.1519/jsc.0b013e3181e840f3" # Fallback de hipertrofia de 2010
+            seed_dois.append(doi_url.replace("https://doi.org/", ""))
+
+    is_fallback = False
+    if len(seed_dois) < 3:
+        is_fallback = True
+        seed_dois = [
+            "10.1519/jsc.0b013e3181e840f3", # Mechanisms of Muscle Hypertrophy (2010)
+            "10.1519/jsc.0000000000002200", # Low- vs. High-Load Resistance Training (2017)
+            "10.1007/s40279-014-0264-9"      # Blood-Flow Restriction Training (2014)
+        ]
         print("\n" + "=" * 80)
-        print("AVISO DE LOG (FALLBACK ATIVO):")
-        print("Como a busca por texto falhou ou não retornou resultados com DOI,")
-        print("o script está utilizando o DOI de fallback clássico de hipertrofia:")
-        print("10.1519/jsc.0b013e3181e840f3 (The Mechanisms of Muscle Hypertrophy...)")
-        print("Esse grafo gerado pertence ao seu domínio real de treinamento de força.")
+        print("AVISO DE SEGURANÇA DE DADOS (FALLBACK ATIVO):")
+        print("Como a busca por texto falhou ou não retornou dados de sementes suficientes,")
+        print("o script está utilizando 3 DOIs de fallback clássicos de hipertrofia.")
+        print("Qualquer processamento subsequente deve marcar a origem destes dados.")
         print("=" * 80 + "\n")
 
     # Limitamos para 5 de cada lado para rodar o teste de forma ágil e evitar throttles
-    graph = agent.build_citation_graph(seed_doi, backward_limit=5, forward_limit=5)
-    print(f"\nGrafo: {graph.number_of_nodes()} nós, {graph.number_of_edges()} arestas")
+    graph = agent.build_citation_graph(seed_dois, backward_limit=5, forward_limit=5)
+    
+    if is_fallback:
+        graph.graph["source"] = "fallback_static"
+    else:
+        graph.graph["source"] = "api"
+        
+    print(f"Proveniência dos dados do grafo (graph.graph['source']): {graph.graph.get('source')}")
+    print(f"Grafo de Citações: {graph.number_of_nodes()} nós, {graph.number_of_edges()} arestas")
 
-    print("\nTop 10 por centralidade (lembre: pouco confiável com 1 seed só):")
+    print("\nRanking de Centralidade (PageRank) - Múltiplos Seeds:")
     for title, score in agent.rank_by_centrality(graph)[:10]:
         print(f"  {score:.4f}  {title}")
 
