@@ -7,7 +7,7 @@ OPENALEX_BASE = "https://api.openalex.org/works"
 
 # Boa prática de API pública: identificar-se no header/param para entrar
 # no "polite pool" da OpenAlex (rate limit mais generoso, menos throttle)
-HEADERS = {"User-Agent": "SciLaunch-DiscoveryAgent (mailto:seu-email@exemplo.com)"}
+HEADERS = {"User-Agent": "SciLaunch-DiscoveryAgent (mailto:emmanuel.nunes.discovery@gmail.com)"}
 
 
 class SearchAgent:
@@ -17,7 +17,7 @@ class SearchAgent:
     empacotar algo vago sob um nome bonito.
     """
 
-    def __init__(self, contact_email: str = "seu-email@exemplo.com"):
+    def __init__(self, contact_email: str = "emmanuel.nunes.discovery@gmail.com"):
         # OpenAlex pede identificação para priorizar no "polite pool"
         self.headers = {"User-Agent": f"SciLaunch-SearchAgent (mailto:{contact_email})"}
 
@@ -109,19 +109,39 @@ class SearchAgent:
 
 
 if __name__ == "__main__":
-    agent = SearchAgent(contact_email="seu-email@exemplo.com")
+    agent = SearchAgent(contact_email="emmanuel.nunes.discovery@gmail.com")
 
     # --- Teste 1: busca por texto real (o que faltava) ---
     QUERY = "resistance training structural variables"
-    results = agent.search_by_keyword(QUERY, limit=10)
-    print(f"Busca por '{QUERY}': {len(results)} resultados")
-    for w in results[:5]:
-        print(f"  - {w.get('display_name')} ({w.get('publication_year')})")
+    results = []
+    try:
+        results = agent.search_by_keyword(QUERY, limit=10)
+        print(f"Busca por '{QUERY}': {len(results)} resultados")
+        for w in results[:5]:
+            print(f"  - {w.get('display_name')} ({w.get('publication_year')})")
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 503:
+            print(f"\n[Aviso] A busca por texto da API do OpenAlex está temporariamente indisponível (HTTP 503 - Rate Limit).")
+            print("Isso ocorre devido a alta carga no motor de busca pública anônima do OpenAlex.")
+            print("Prosseguindo com o Teste 2 usando o DOI de fallback...\n")
+        else:
+            print(f"\n[Erro] Falha ao realizar busca por palavra-chave: {e}\n")
 
     # --- Teste 2: expansão por citação a partir de um DOI real ---
-    # Troque pelo DOI de um paper-base do seu referencial teórico
-    SEED_DOI = "10.1000/exemplo-troque-por-doi-real"
-    graph = agent.build_citation_graph(SEED_DOI)
+    seed_doi = None
+    for w in results:
+        doi_url = w.get("doi")
+        if doi_url:
+            seed_doi = doi_url.replace("https://doi.org/", "")
+            print(f"\nUsando o DOI encontrado na busca para o teste de expansão: {seed_doi}")
+            break
+            
+    if not seed_doi:
+        seed_doi = "10.1152/jappl.1989.66.1.232" # Fallback clássico
+        print(f"\nUsando DOI clássico de fallback: {seed_doi}")
+
+    # Limitamos para 5 de cada lado para rodar o teste de forma ágil e evitar throttles
+    graph = agent.build_citation_graph(seed_doi, backward_limit=5, forward_limit=5)
     print(f"\nGrafo: {graph.number_of_nodes()} nós, {graph.number_of_edges()} arestas")
 
     print("\nTop 10 por centralidade (lembre: pouco confiável com 1 seed só):")
@@ -129,3 +149,5 @@ if __name__ == "__main__":
         print(f"  {score:.4f}  {title}")
 
     agent.export_interactive_html(graph)
+
+
