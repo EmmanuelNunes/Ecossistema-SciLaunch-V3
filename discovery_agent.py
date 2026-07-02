@@ -23,6 +23,8 @@ class SearchAgent:
         self.headers = {"User-Agent": f"SciLaunch-SearchAgent (mailto:{contact_email})"}
         # Se não for passada api_key, tenta carregar da variável de ambiente OPENALEX_API_KEY
         self.api_key = api_key or os.environ.get("OPENALEX_API_KEY")
+        # Cache local em memória para evitar requisições redundantes à API na mesma sessão
+        self._works_cache = {}
 
     # ------------------------------------------------------------------
     # 1. BUSCA POR TEXTO — o que faltava confirmadamente no sistema antigo
@@ -36,14 +38,18 @@ class SearchAgent:
         filters: dict opcional, ex: {"from_publication_date": "2015-01-01"}
         title_and_abstract_only: se True, restringe a busca ao título e resumo para aumentar a precisão de domínio.
         """
+        # Higieniza a query removendo caracteres que quebram o interpretador de filtros do OpenAlex
+        clean_query = query.replace(",", " ").replace(":", " ")
+        clean_query = " ".join(clean_query.split())
+
         params = {"per-page": limit}
         
         filter_list = []
         if title_and_abstract_only:
             # A busca em campos específicos no OpenAlex deve ser enviada como um filtro
-            filter_list.append(f"title_and_abstract.search:{query}")
+            filter_list.append(f"title_and_abstract.search:{clean_query}")
         else:
-            params["search"] = query
+            params["search"] = clean_query
             
         if filters:
             for k, v in filters.items():
@@ -63,19 +69,36 @@ class SearchAgent:
     # 2. EXPANSÃO POR CITAÇÃO — o que a v1 deste arquivo já fazia
     # ------------------------------------------------------------------
     def get_work_by_doi(self, doi: str) -> dict:
+        doi_key = doi.lower().strip()
+        if doi_key in self._works_cache:
+            return self._works_cache[doi_key]
+
         url = f"{OPENALEX_BASE}/https://doi.org/{doi}"
         params = {}
         if self.api_key:
             params["api_key"] = self.api_key
         r = requests.get(url, headers=self.headers, params=params, timeout=15)
         r.raise_for_status()
-        return r.json()
+        work = r.json()
+        
+        # Alimenta o cache com o DOI e com o ID do OpenAlex
+        self._works_cache[doi_key] = work
+        work_id = work.get("id")
+        if work_id:
+            self._works_cache[work_id.lower()] = work
+            
+        return work
 
     def get_referenced_works(self, work: dict, limit: int = 15) -> list[dict]:
         """BACKWARD: papers que o work cita."""
         ref_ids = work.get("referenced_works", [])[:limit]
         results = []
         for wid in ref_ids:
+            wid_key = wid.lower()
+            if wid_key in self._works_cache:
+                results.append(self._works_cache[wid_key])
+                continue
+
             # Corrige o ID canônico para apontar para a API ao invés do site público HTML
             api_url = wid.replace("https://openalex.org/", f"{OPENALEX_BASE}/")
             params = {}
@@ -84,7 +107,14 @@ class SearchAgent:
             try:
                 r = requests.get(api_url, headers=self.headers, params=params, timeout=15)
                 if r.ok:
-                    results.append(r.json())
+                    res_json = r.json()
+                    results.append(res_json)
+                    # Registra no cache
+                    self._works_cache[wid_key] = res_json
+                    doi = res_json.get("doi")
+                    if doi:
+                        clean_doi = doi.replace("https://doi.org/", "").lower().strip()
+                        self._works_cache[clean_doi] = res_json
             except Exception as e:
                 print(f"[Erro] Falha ao recuperar referência {wid}: {e}")
             sleep(0.1)  # respeito ao rate limit, não é decoração
@@ -97,7 +127,19 @@ class SearchAgent:
             params["api_key"] = self.api_key
         r = requests.get(OPENALEX_BASE, headers=self.headers, params=params, timeout=15)
         r.raise_for_status()
-        return r.json().get("results", [])
+        works = r.json().get("results", [])
+        
+        # Alimenta o cache com os trabalhos citadores encontrados
+        for work in works:
+            w_id = work.get("id")
+            if w_id:
+                self._works_cache[w_id.lower()] = work
+            doi = work.get("doi")
+            if doi:
+                clean_doi = doi.replace("https://doi.org/", "").lower().strip()
+                self._works_cache[clean_doi] = work
+                
+        return works
 
     def build_citation_graph(self, seed_dois: str | list[str], backward_limit=15, forward_limit=15) -> nx.DiGraph:
         """
@@ -113,6 +155,7 @@ class SearchAgent:
             
         G.graph["source"] = "api"
         G.graph["seeds"] = seed_dois
+        G.graph["failed_seeds"] = []
         
         for seed_doi in seed_dois:
             try:
@@ -136,6 +179,7 @@ class SearchAgent:
                     G.add_edge(cid, seed_id)
             except Exception as e:
                 print(f"[Erro] Falha ao processar a semente {seed_doi}: {e}")
+                G.graph["failed_seeds"].append(seed_doi)
 
         return G
 
@@ -171,6 +215,18 @@ if __name__ == "__main__":
         print(f"\n[Info] Utilizando chave de API detectada via variável de ambiente ({masked_key})\n")
 
     agent = SearchAgent(contact_email="emmanuel.nunes.discovery@gmail.com")
+
+    # --- Teste de Higienização de Query ---
+    DIRTY_QUERY = "resistance training, hypertrophy: structural variables"
+    print(f"=== TESTE DE HIGIENIZAÇÃO DE QUERY ===")
+    print(f"Query original: '{DIRTY_QUERY}'")
+    try:
+        # Testa a busca com a query suja contendo vírgulas e dois-pontos para garantir que ela não quebre com 400 Bad Request
+        results_dirty = agent.search_by_keyword(DIRTY_QUERY, limit=3, title_and_abstract_only=True)
+        print(f"Busca com query higienizada retornou {len(results_dirty)} resultados com sucesso (sem erro 400).")
+    except Exception as e:
+        print(f"[Aviso/Erro] Teste de higienização falhou (pode ser rate limit): {e}")
+    print("=" * 40 + "\n")
 
     # --- Teste 1: busca por texto real refinada (Precisão de Domínio) ---
     QUERY = "resistance training hypertrophy"
@@ -213,16 +269,35 @@ if __name__ == "__main__":
         print("Qualquer processamento subsequente deve marcar a origem destes dados.")
         print("=" * 80 + "\n")
 
+    # Adicionamos propositalmente um DOI inválido para testar o rastreamento estruturado de falhas de seeds
+    print("=== TESTE DE RASTREAMENTO DE SEEDS INVÁLIDOS ===")
+    test_seeds = seed_dois.copy()
+    test_seeds.append("10.9999/invalid-doi-test")
+    print(f"Testando a construção de grafo com seeds: {test_seeds}")
+    
     # Limitamos para 5 de cada lado para rodar o teste de forma ágil e evitar throttles
-    graph = agent.build_citation_graph(seed_dois, backward_limit=5, forward_limit=5)
+    graph = agent.build_citation_graph(test_seeds, backward_limit=5, forward_limit=5)
     
     if is_fallback:
         graph.graph["source"] = "fallback_static"
     else:
         graph.graph["source"] = "api"
         
+    print(f"\n=== RESULTADOS E AUDITORIA DO GRAFO ===")
     print(f"Proveniência dos dados do grafo (graph.graph['source']): {graph.graph.get('source')}")
+    print(f"Sementes fornecidas: {graph.graph.get('seeds')}")
+    print(f"Sementes que FALHARAM no processamento (failed_seeds): {graph.graph.get('failed_seeds')}")
     print(f"Grafo de Citações: {graph.number_of_nodes()} nós, {graph.number_of_edges()} arestas")
+
+    # Verifica o número de componentes fracamente conectados para alertar sobre dispersão
+    num_components = nx.number_weakly_connected_components(graph)
+    print(f"Número de componentes desconectados (Weakly Connected Components): {num_components}")
+    if num_components > 1:
+        print("[Aviso Metodológico] O grafo possui múltiplos componentes desconectados.")
+        print(" O PageRank global terá pesos distribuídos de forma isolada entre sementes.")
+        
+    # Mostra a economia de rede proporcionada pelo cache local
+    print(f"Total de trabalhos em cache de memória local: {len(agent._works_cache)} itens.")
 
     print("\nRanking de Centralidade (PageRank) - Múltiplos Seeds:")
     for title, score in agent.rank_by_centrality(graph)[:10]:
